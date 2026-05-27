@@ -25,6 +25,11 @@ class MockFixSession extends EventEmitter implements IFixSession {
 class MockFixEngine implements IFixEngine {
   private readonly sessionMap = new Map<string, MockFixSession>();
   readonly sent: Array<{ sessionId: string; fields: Map<number, string> }> = [];
+  readonly sentGroups: Array<{
+    sessionId: string;
+    header: Map<number, string>;
+    groups: Map<number, string>[];
+  }> = [];
 
   start(): void {}
   async stop(): Promise<void> {}
@@ -51,6 +56,14 @@ class MockFixEngine implements IFixEngine {
 
   sendMessage(sessionId: string, fields: Map<number, string>): void {
     this.sent.push({ sessionId, fields });
+  }
+
+  sendGroupMessage(
+    sessionId: string,
+    header: Map<number, string>,
+    groups: Map<number, string>[],
+  ): void {
+    this.sentGroups.push({ sessionId, header, groups });
   }
 }
 
@@ -488,6 +501,515 @@ describe('Gateway', () => {
       const erForResting = engine.sent.find((m) => m.sessionId === SESSION_A);
       expect(erForResting).toBeDefined();
       expect(erForResting!.fields.get(39)).toBe('2'); // Filled — this is the resting side's ER
+    });
+  });
+
+  // ─── Issue #12: Market Data ─────────────────────────────────────────────────
+
+  describe('MarketDataRequest', () => {
+    const SESSION = 'GW-CLI-FIX.4.4';
+
+    function makeMDReqMsg(
+      subscriptionType: '0' | '1' | '2',
+      symbol = 'CLM26',
+      reqId  = 'MD-1',
+      sessionId = SESSION,
+    ): IMessage {
+      return makeMockMessage({
+        35:  'V',            // MarketDataRequest
+        262: reqId,          // MDReqID
+        263: subscriptionType,
+        55:  symbol,
+      }, sessionId);
+    }
+
+    /** Direct helper: create a minimal Order-shaped object for use in publish() calls. */
+    function makeOrder(overrides: Partial<{
+      id: string; side: 'Buy' | 'Sell'; price: number; quantity: number; filledQuantity: number;
+    }> = {}): import('@matchingengine/shared-types').Order {
+      return {
+        id: 'O1', symbol: 'CLM26', side: 'Buy', type: 'Limit',
+        quantity: 10, price: 100.25, account: 'ACC1', trader: 'TDR1',
+        state: 'New', filledQuantity: 0, timestamp: 1000,
+        ...overrides,
+      };
+    }
+
+    it('responds with a MarketDataSnapshotFullRefresh (35=W) for a Snapshot request (type=0)', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('0'));
+
+      expect(engine.sentGroups).toHaveLength(1);
+      expect(engine.sentGroups[0]!.header.get(35)).toBe('W');
+    });
+
+    it('Snapshot W contains one group per resting order with correct fields', () => {
+      const { engine, gateway } = makeOpenSetup();
+      // Place a resting buy
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '10', 44: '100.25' }));
+      engine.sentGroups.length = 0; // clear any sentinel sends
+
+      gateway.handleMessage(makeMDReqMsg('0'));
+
+      const { header, groups } = engine.sentGroups[0]!;
+      expect(header.get(55)).toBe('CLM26');   // Symbol in header
+      expect(header.get(268)).toBe('1');       // NoMDEntries
+
+      const g = groups[0]!;
+      expect(g.get(269)).toBe('0');            // MDEntryType = Bid (Buy)
+      expect(g.get(270)).toBe('100.25');       // MDEntryPx
+      expect(g.get(271)).toBe('10');           // MDEntrySize = remaining qty
+    });
+
+    it('subscription (type=1) sends an opening Snapshot W', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('1'));
+
+      expect(engine.sentGroups).toHaveLength(1);
+      expect(engine.sentGroups[0]!.header.get(35)).toBe('W');
+    });
+
+    it('subscription: OrderAdded event produces incremental X with New action', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', { type: 'OrderAdded', order: makeOrder({ id: 'O1', side: 'Buy', price: 100.25, quantity: 10 }) });
+
+      expect(engine.sentGroups).toHaveLength(1);
+      const g = engine.sentGroups[0]!;
+      expect(g.header.get(35)).toBe('X');
+      expect(g.groups[0]!.get(279)).toBe('0');  // MDUpdateAction = New
+      expect(g.groups[0]!.get(269)).toBe('0');  // MDEntryType = Bid
+      expect(g.groups[0]!.get(270)).toBe('100.25'); // MDEntryPx
+      expect(g.groups[0]!.get(271)).toBe('10');     // MDEntrySize
+      expect(g.groups[0]!.get(278)).toBe('O1');     // MDEntryID
+    });
+
+    it('subscription: TradeEvent produces incremental X with Trade entry type', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', {
+        trade: { symbol: 'CLM26', price: 100.25, quantity: 5, aggressingOrderId: 'O2', restingOrderId: 'O1' },
+      });
+
+      const g = engine.sentGroups[0]!;
+      expect(g.header.get(35)).toBe('X');
+      expect(g.groups[0]!.get(279)).toBe('0');  // New
+      expect(g.groups[0]!.get(269)).toBe('2');  // MDEntryType = Trade
+      expect(g.groups[0]!.get(270)).toBe('100.25'); // price
+      expect(g.groups[0]!.get(271)).toBe('5');      // quantity
+    });
+
+    it('subscription: OrderFilled produces incremental X with Delete action and zero size', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', { type: 'OrderFilled', order: makeOrder({ id: 'O1', filledQuantity: 10 }) });
+
+      const g = engine.sentGroups[0]!;
+      expect(g.groups[0]!.get(279)).toBe('2');  // Delete
+      expect(g.groups[0]!.get(271)).toBe('0');  // MDEntrySize = 0
+    });
+
+    it('subscription: OrderPartiallyFilled produces incremental X with Change action and remaining size', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', {
+        type: 'OrderPartiallyFilled',
+        order: makeOrder({ id: 'O1', quantity: 10, filledQuantity: 3 }),
+      });
+
+      const g = engine.sentGroups[0]!;
+      expect(g.groups[0]!.get(279)).toBe('1');  // Change
+      expect(g.groups[0]!.get(271)).toBe('7');  // MDEntrySize = remaining = 10 - 3
+    });
+
+    it('subscription: OrderCancelled produces incremental X with Delete action', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', { type: 'OrderCancelled', order: makeOrder({ id: 'O1' }) });
+
+      const g = engine.sentGroups[0]!;
+      expect(g.groups[0]!.get(279)).toBe('2');  // Delete
+    });
+
+    it('unsubscribe (type=2) stops incremental updates for that Symbol', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1'));        // subscribe
+      gateway.handleMessage(makeMDReqMsg('2'));        // unsubscribe
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', { type: 'OrderAdded', order: makeOrder() });
+
+      expect(engine.sentGroups).toHaveLength(0);
+    });
+
+    it('a session can hold subscriptions to two instruments and receives independent updates', () => {
+      const { engine, registry, publisher, gateway } = makeSetup();
+      registry.add(makeInstrumentDef({ symbol: 'CLM26' }));
+      registry.add(makeInstrumentDef({ symbol: 'CLZ26' }));
+
+      gateway.handleMessage(makeMDReqMsg('1', 'CLM26'));
+      gateway.handleMessage(makeMDReqMsg('1', 'CLZ26'));
+      engine.sentGroups.length = 0;
+
+      publisher.publish('CLM26', { type: 'OrderAdded', order: { ...makeOrder(), symbol: 'CLM26' } });
+
+      expect(engine.sentGroups).toHaveLength(1);
+      expect(engine.sentGroups[0]!.groups[0]!.get(55)).toBe('CLM26');
+    });
+
+    it('no incremental X after session disconnects', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      const session = engine.getSessions()[0]!;
+      gateway.handleMessage(makeMDReqMsg('1', 'CLM26', 'MD-1', session.id));
+      engine.sentGroups.length = 0;
+
+      session.simulateStatus('disconnected'); // triggers publisher.disconnect()
+
+      publisher.publish('CLM26', { type: 'OrderAdded', order: makeOrder() });
+
+      expect(engine.sentGroups).toHaveLength(0);
+    });
+
+    it('end-to-end: subscribe then place a resting Limit Order → incremental OrderAdded X is delivered', () => {
+      const { engine, gateway } = makeOpenSetup();
+      gateway.handleMessage(makeMDReqMsg('1')); // subscribe
+      engine.sentGroups.length = 0;            // clear the opening snapshot
+
+      // Place a new resting Buy — handleNewOrder must publish the OrderAdded event
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '5', 44: '100.25' }));
+
+      // At least one incremental X should have been sent
+      const xMessages = engine.sentGroups.filter(g => g.header.get(35) === 'X');
+      expect(xMessages.length).toBeGreaterThan(0);
+
+      const addedMsg = xMessages.find(g => g.groups[0]!.get(279) === '0'); // New action
+      expect(addedMsg).toBeDefined();
+      expect(addedMsg!.groups[0]!.get(271)).toBe('5');    // MDEntrySize = qty
+      expect(addedMsg!.groups[0]!.get(270)).toBe('100.25'); // MDEntryPx
+    });
+
+    it('snapshot-only (type=0): no incremental X sent when events are published after the snapshot', () => {
+      const { engine, publisher, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('0')); // snapshot-only
+      engine.sentGroups.length = 0;
+
+      // Publish an event — should NOT trigger an X since we unsubscribed
+      publisher.publish('CLM26', { type: 'OrderAdded', order: makeOrder() });
+
+      expect(engine.sentGroups).toHaveLength(0); // no incremental
+    });
+
+    it('Snapshot W echoes MDReqID', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('0', 'CLM26', 'MY-REQ-42'));
+
+      expect(engine.sentGroups[0]!.header.get(262)).toBe('MY-REQ-42');
+    });
+  });
+
+  // ─── Issue #11: Reference Data ──────────────────────────────────────────────
+
+  describe('SecurityListRequest', () => {
+    function makeSecurityListReqMsg(overrides: Record<number, string> = {}, sessionId = 'GW-CLI-FIX.4.4'): IMessage {
+      return makeMockMessage({
+        35: 'x',       // MsgType = SecurityListRequest
+        320: 'REQ-1',  // SecurityReqID
+        ...overrides,
+      }, sessionId);
+    }
+
+    it('responds with a SecurityList (MsgType=y) when a SecurityListRequest is received', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeSecurityListReqMsg());
+
+      expect(engine.sentGroups).toHaveLength(1);
+      expect(engine.sentGroups[0]!.header.get(35)).toBe('y'); // SecurityList
+    });
+
+    it('returns an empty SecurityList (0 groups) when no Instruments are registered', () => {
+      const { engine, gateway } = makeSetup(); // empty registry — no instruments added
+
+      gateway.handleMessage(makeSecurityListReqMsg());
+
+      expect(engine.sentGroups).toHaveLength(1); // response sent, not an error
+      const { header, groups } = engine.sentGroups[0]!;
+      expect(groups).toHaveLength(0);
+      expect(header.get(146)).toBe('0'); // NoRelatedSym = 0
+      expect(header.get(560)).toBe('0'); // SecurityRequestResult = valid
+    });
+
+    it('each group carries Symbol, name, tick size, contract size, currency, and expiry date', () => {
+      const { engine, registry, gateway } = makeSetup();
+      registry.add(makeInstrumentDef({
+        symbol: 'CLM26',
+        name: 'Crude Light March 2026',
+        tickSize: 0.25,
+        contractSize: 1000,
+        currency: 'USD',
+        expiryDate: new Date('2026-03-31'),
+      }));
+
+      gateway.handleMessage(makeSecurityListReqMsg());
+
+      const group = engine.sentGroups[0]!.groups[0]!;
+      expect(group.get(55)).toBe('CLM26');           // Symbol
+      expect(group.get(107)).toBe('Crude Light March 2026'); // SecurityDesc = name
+      expect(group.get(15)).toBe('USD');             // Currency
+      expect(group.get(231)).toBe('1000');           // ContractMultiplier = contract size
+      expect(group.get(541)).toBe('20260331');       // MaturityDate = expiry (YYYYMMDD)
+      expect(group.get(969)).toBe('0.25');           // MinPriceIncrement = tick size
+    });
+
+    it('response contains one group per registered Instrument and NoRelatedSym matches', () => {
+      const { engine, registry, gateway } = makeSetup();
+      registry.add(makeInstrumentDef({ symbol: 'CLM26' }));
+      registry.add(makeInstrumentDef({ symbol: 'CLZ26' }));
+
+      gateway.handleMessage(makeSecurityListReqMsg());
+
+      const { header, groups } = engine.sentGroups[0]!;
+      expect(groups).toHaveLength(2);
+      expect(header.get(146)).toBe('2'); // NoRelatedSym
+      const symbols = groups.map(g => g.get(55));
+      expect(symbols).toContain('CLM26');
+      expect(symbols).toContain('CLZ26');
+    });
+
+    it('echoes the SecurityReqID from the request in the response header', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeSecurityListReqMsg({ 320: 'MY-REQUEST-42' }));
+
+      expect(engine.sentGroups[0]!.header.get(320)).toBe('MY-REQUEST-42');
+    });
+
+    it('routes the SecurityList response to the Session that sent the request', () => {
+      const { engine, gateway } = makeOpenSetup();
+      const SESSION = 'SOME-SESSION';
+
+      gateway.handleMessage(makeSecurityListReqMsg({}, SESSION));
+
+      expect(engine.sentGroups[0]!.sessionId).toBe(SESSION);
+    });
+  });
+
+  // ─── Issue #10: Cancellation Request flow ───────────────────────────────────
+
+  describe('OrderCancelRequest', () => {
+    const SESSION_A = 'SESSION-A';
+    const SESSION_B = 'SESSION-B';
+
+    function makeCancelMsg(
+      orderId: string,
+      overrides: Record<number, string> = {},
+      sessionId = SESSION_A,
+    ): IMessage {
+      return makeMockMessage({
+        35: 'F',       // MsgType = OrderCancelRequest
+        37: orderId,   // OrderID (engine's internal ID)
+        11: 'CXL-001', // ClOrdID of this cancel request
+        55: 'CLM26',   // Symbol
+        54: '1',       // Side = Buy
+        ...overrides,
+      }, sessionId);
+    }
+
+    it('sends a Cancelled ER when the client cancels its own resting Order', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({}, SESSION_A));
+      const orderId = engine.sent.at(-1)!.fields.get(37)!;
+      engine.sent.length = 0;
+
+      gateway.handleMessage(makeCancelMsg(orderId));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.sessionId).toBe(SESSION_A);
+      expect(engine.sent[0]!.fields.get(39)).toBe('4');  // Cancelled
+      expect(engine.sent[0]!.fields.get(150)).toBe('4'); // ExecType = Cancelled
+    });
+
+    it('Cancelled ER for a partially-filled Order carries CumQty equal to the filled amount', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      // Place resting Buy 10@100.25 from SESSION_A
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '10', 44: '100.25' }, SESSION_A));
+      const restingOrderId = engine.sent.at(-1)!.fields.get(37)!;
+
+      // Aggressor Sell 3@100.25 from SESSION_B — partially fills the resting order
+      gateway.handleMessage(makeNewOrderMsg({ 54: '2', 38: '3', 44: '100.25' }, SESSION_B));
+      engine.sent.length = 0;
+
+      // Now cancel the partially-filled resting order
+      gateway.handleMessage(makeCancelMsg(restingOrderId));
+
+      const { fields } = engine.sent[0]!;
+      expect(fields.get(39)).toBe('4');   // Cancelled
+      expect(fields.get(38)).toBe('10');  // OrderQty = original 10
+      expect(fields.get(14)).toBe('3');   // CumQty = 3 (filled so far)
+      expect(fields.get(151)).toBe('0');  // LeavesQty = 0 (cancelled)
+    });
+
+    it('sends a Cancelled ER to the originating Session when the market closes with resting Orders', () => {
+      const { engine, registry, gateway } = makeOpenSetup();
+
+      // Place two resting orders from different sessions
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '10', 44: '100.25' }, SESSION_A));
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '5',  44: '100.00' }, SESSION_B));
+      engine.sent.length = 0;
+
+      // Close the market — engine cancels all resting orders
+      registry.setMarketState('CLM26', 'Closed');
+
+      expect(engine.sent).toHaveLength(2); // one ER per resting order
+
+      const erA = engine.sent.find(m => m.sessionId === SESSION_A)!;
+      const erB = engine.sent.find(m => m.sessionId === SESSION_B)!;
+
+      expect(erA).toBeDefined();
+      expect(erA.fields.get(39)).toBe('4');  // Cancelled
+      expect(erA.fields.get(38)).toBe('10'); // OrderQty
+
+      expect(erB).toBeDefined();
+      expect(erB.fields.get(39)).toBe('4');  // Cancelled
+      expect(erB.fields.get(38)).toBe('5');  // OrderQty
+    });
+
+    it('sends a Rejected ER with reason CannotCancelFilledOrder when the Order is already Filled', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      // Place a resting Buy 10@100.25 from SESSION_A
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '10', 44: '100.25' }, SESSION_A));
+      const orderId = engine.sent.at(-1)!.fields.get(37)!;
+
+      // Fully fill it by agressing from SESSION_B
+      gateway.handleMessage(makeNewOrderMsg({ 54: '2', 38: '10', 44: '100.25' }, SESSION_B));
+      engine.sent.length = 0;
+
+      // Attempt to cancel the now-Filled order from SESSION_A
+      gateway.handleMessage(makeCancelMsg(orderId));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.fields.get(39)).toBe('8');                  // Rejected
+      expect(engine.sent[0]!.fields.get(58)).toBe('CannotCancelFilledOrder'); // Text
+    });
+
+    it('sends a Rejected ER for an unknown Order ID', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeCancelMsg('ORDER-DOES-NOT-EXIST'));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.sessionId).toBe(SESSION_A);
+      expect(engine.sent[0]!.fields.get(39)).toBe('8'); // Rejected
+    });
+
+    it('sends a Rejected ER when a cancel request comes from a different Session', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({}, SESSION_A));
+      const orderId = engine.sent.at(-1)!.fields.get(37)!;
+      engine.sent.length = 0;
+
+      // SESSION_B tries to cancel SESSION_A's order
+      gateway.handleMessage(makeCancelMsg(orderId, {}, SESSION_B));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.sessionId).toBe(SESSION_B); // Rejected ER goes to requester
+      expect(engine.sent[0]!.fields.get(39)).toBe('8');  // Rejected
+    });
+
+    it('Cancelled ER echoes OrderID, ClOrdID, Symbol, Side and carries correct quantities', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      // Place a resting Buy 10@100.25
+      gateway.handleMessage(makeNewOrderMsg({ 54: '1', 38: '10', 44: '100.25', 11: 'ORD-ORIG' }, SESSION_A));
+      const orderId = engine.sent.at(-1)!.fields.get(37)!;
+      engine.sent.length = 0;
+
+      gateway.handleMessage(makeCancelMsg(orderId, { 11: 'CXL-42' }));
+
+      const { fields } = engine.sent[0]!;
+      expect(fields.get(37)).toBe(orderId);       // OrderID echoed
+      expect(fields.get(11)).toBe('CXL-42');       // ClOrdID = cancel request's ClOrdID
+      expect(fields.get(55)).toBe('CLM26');        // Symbol
+      expect(fields.get(54)).toBe('1');            // Side = Buy
+      expect(fields.get(38)).toBe('10');           // OrderQty = original qty
+      expect(fields.get(14)).toBe('0');            // CumQty = 0 (unfilled resting order)
+      expect(fields.get(151)).toBe('0');           // LeavesQty = 0 (terminal)
+    });
+  });
+
+  // ─── Session management: getSessions / hasSession ──────────────────────────
+
+  describe('session management', () => {
+    it('addSession returns the session id', () => {
+      const { gateway } = makeSetup();
+      gateway.start([]);
+      const id = gateway.addSession(makeSessionConfig('GW', 'CLI'));
+      expect(id).toBe('GW-CLI-FIX.4.4');
+    });
+
+    it('getSessions returns added sessions with inactive status initially', () => {
+      const { gateway } = makeSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      const sessions = gateway.getSessions();
+      expect(sessions).toHaveLength(1);
+      expect(sessions[0]).toEqual({ sessionId: 'GW-CLI-FIX.4.4', status: 'inactive' });
+    });
+
+    it('getSessions reflects active status after session goes active', () => {
+      const { engine, gateway } = makeSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      const session = engine.getSessions()[0] as MockFixSession;
+      session.simulateStatus('active');
+      const sessions = gateway.getSessions();
+      expect(sessions[0]!.status).toBe('active');
+    });
+
+    it('getSessions reflects inactive status after session disconnects', () => {
+      const { engine, gateway } = makeSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      const session = engine.getSessions()[0] as MockFixSession;
+      session.simulateStatus('active');
+      session.simulateStatus('disconnected');
+      const sessions = gateway.getSessions();
+      expect(sessions[0]!.status).toBe('inactive');
+    });
+
+    it('hasSession returns true for a configured session', () => {
+      const { gateway } = makeSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      expect(gateway.hasSession('GW-CLI-FIX.4.4')).toBe(true);
+    });
+
+    it('hasSession returns false for an unknown session', () => {
+      const { gateway } = makeSetup();
+      gateway.start([]);
+      expect(gateway.hasSession('NOBODY')).toBe(false);
+    });
+
+    it('hasSession returns false after removeSession', async () => {
+      const { gateway } = makeSetup();
+      gateway.start([makeSessionConfig('GW', 'CLI')]);
+      await gateway.removeSession('GW-CLI-FIX.4.4');
+      expect(gateway.hasSession('GW-CLI-FIX.4.4')).toBe(false);
     });
   });
 });

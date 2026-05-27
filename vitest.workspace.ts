@@ -3,4 +3,6 @@ import { defineWorkspace } from 'vitest/config';
 export default defineWorkspace([
   'packages/engine',
   'packages/gateway',
+  'packages/admin-api',
+  'packages/admin-ui',
 ]);

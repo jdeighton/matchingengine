@@ -8,7 +8,8 @@ export type CancelReason =
   | 'InsufficientLiquidity' // Market order remainder, or market order vs empty book
   | 'MarketClose' // Instrument transitioned to Closed
   | 'ClientRequest' // Client-submitted Cancellation Request
-  | 'CrossSessionCancel'; // Cancellation Request from a different Session — rejected
+  | 'CrossSessionCancel' // Cancellation Request from a different Session — rejected
+  | 'CannotCancelFilledOrder'; // Cancellation Request for an already-Filled Order
 
 // ─── Instrument ───────────────────────────────────────────────────────────
 

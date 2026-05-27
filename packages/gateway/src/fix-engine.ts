@@ -25,6 +25,16 @@ export interface IFixEngine {
   getSessions(): IFixSession[];
   getSession(sessionId: string): IFixSession | undefined;
   sendMessage(sessionId: string, fields: Map<number, string>): void;
+  /**
+   * Send a FIX message that contains a repeating group (e.g. SecurityList).
+   * @param header  Non-repeating fields (MsgType, response ID, result, count, etc.)
+   * @param groups  One Map per repeating-group entry (one per Instrument for SecurityList).
+   */
+  sendGroupMessage(
+    sessionId: string,
+    header: Map<number, string>,
+    groups: Map<number, string>[],
+  ): void;
 }
 
 export type { SessionConfig, SessionStatus, Message, IMessage };

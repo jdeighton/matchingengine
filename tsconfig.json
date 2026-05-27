@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/shared-types" },
+    { "path": "./packages/engine" },
+    { "path": "./packages/gateway" },
+    { "path": "./packages/admin-api" },
+    { "path": "./packages/admin-ui" }
+  ]
+}

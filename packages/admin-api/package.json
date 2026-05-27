@@ -1,0 +1,13 @@
+{
+  "name": "@matchingengine/admin-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --build"
+  },
+  "dependencies": {
+    "@matchingengine/shared-types": "*",
+    "@matchingengine/engine": "*"
+  }
+}

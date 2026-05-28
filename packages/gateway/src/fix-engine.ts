@@ -37,4 +37,4 @@ export interface IFixEngine {
   ): void;
 }
 
-export type { SessionConfig, SessionStatus, Message, IMessage };
+export type { SessionConfig, SessionStatus, Message };

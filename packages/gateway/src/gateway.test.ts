@@ -367,6 +367,50 @@ describe('Gateway', () => {
 
       expect(engine.sent[0]!.fields.get(39)).toBe('8');
     });
+
+    it('includes OrdRejReason (tag 103) = 1 (Unknown symbol) for unknown symbol rejections', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({ 55: 'UNKNOWN' }));
+
+      expect(engine.sent[0]!.fields.get(103)).toBe('1');
+    });
+
+    it('includes OrdRejReason (tag 103) = 2 (Exchange closed) when market is Closed', () => {
+      const { engine, registry, gateway } = makeSetup();
+      registry.add(makeInstrumentDef());
+
+      gateway.handleMessage(makeNewOrderMsg());
+
+      expect(engine.sent[0]!.fields.get(103)).toBe('2');
+    });
+
+    it('includes OrdRejReason (tag 103) = 2 (Exchange closed) when market is Halted', () => {
+      const { engine, registry, gateway } = makeSetup();
+      registry.add(makeInstrumentDef());
+      registry.setMarketState('CLM26', 'Open');
+      registry.setMarketState('CLM26', 'Halted');
+
+      gateway.handleMessage(makeNewOrderMsg());
+
+      expect(engine.sent[0]!.fields.get(103)).toBe('2');
+    });
+
+    it('includes OrdRejReason (tag 103) = 99 (Other) for price-not-on-tick rejections', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({ 44: '100.30' }));
+
+      expect(engine.sent[0]!.fields.get(103)).toBe('99');
+    });
+
+    it('includes OrdRejReason (tag 103) = 99 (Other) for missing required field rejections', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({ 55: '' }));
+
+      expect(engine.sent[0]!.fields.get(103)).toBe('99');
+    });
   });
 
   // ─── Issue #9: Order matching & fill Execution Reports ───────────────────────
@@ -720,6 +764,34 @@ describe('Gateway', () => {
 
       expect(engine.sentGroups[0]!.header.get(262)).toBe('MY-REQ-42');
     });
+
+    it('sends 35=Y (MarketDataRequestReject) for an unknown symbol', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('1', 'UNKNOWN'));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.fields.get(35)).toBe('Y');  // MarketDataRequestReject
+      expect(engine.sent[0]!.fields.get(281)).toBe('0'); // MDReqRejReason = Unknown symbol
+    });
+
+    it('35=Y echoes MDReqID and includes Text with the unknown symbol', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('1', 'NOSYM', 'MY-MD-REQ'));
+
+      const { fields } = engine.sent[0]!;
+      expect(fields.get(262)).toBe('MY-MD-REQ');
+      expect(fields.get(58)).toContain('NOSYM');
+    });
+
+    it('does not send a snapshot W when the symbol is unknown', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMDReqMsg('0', 'UNKNOWN'));
+
+      expect(engine.sentGroups).toHaveLength(0);
+    });
   });
 
   // ─── Issue #11: Reference Data ──────────────────────────────────────────────
@@ -891,7 +963,7 @@ describe('Gateway', () => {
       expect(erB.fields.get(38)).toBe('5');  // OrderQty
     });
 
-    it('sends a Rejected ER with reason CannotCancelFilledOrder when the Order is already Filled', () => {
+    it('sends 35=9 (OrderCancelReject) with CxlRejReason=0 when the Order is already Filled', () => {
       const { engine, gateway } = makeOpenSetup();
 
       // Place a resting Buy 10@100.25 from SESSION_A
@@ -906,21 +978,23 @@ describe('Gateway', () => {
       gateway.handleMessage(makeCancelMsg(orderId));
 
       expect(engine.sent).toHaveLength(1);
-      expect(engine.sent[0]!.fields.get(39)).toBe('8');                  // Rejected
+      expect(engine.sent[0]!.fields.get(35)).toBe('9');                      // OrderCancelReject
+      expect(engine.sent[0]!.fields.get(102)).toBe('0');                     // CxlRejReason = Too late to cancel
       expect(engine.sent[0]!.fields.get(58)).toBe('CannotCancelFilledOrder'); // Text
     });
 
-    it('sends a Rejected ER for an unknown Order ID', () => {
+    it('sends 35=9 (OrderCancelReject) with CxlRejReason=1 for an unknown Order ID', () => {
       const { engine, gateway } = makeOpenSetup();
 
       gateway.handleMessage(makeCancelMsg('ORDER-DOES-NOT-EXIST'));
 
       expect(engine.sent).toHaveLength(1);
       expect(engine.sent[0]!.sessionId).toBe(SESSION_A);
-      expect(engine.sent[0]!.fields.get(39)).toBe('8'); // Rejected
+      expect(engine.sent[0]!.fields.get(35)).toBe('9');  // OrderCancelReject
+      expect(engine.sent[0]!.fields.get(102)).toBe('1'); // CxlRejReason = Unknown order
     });
 
-    it('sends a Rejected ER when a cancel request comes from a different Session', () => {
+    it('sends 35=9 (OrderCancelReject) with CxlRejReason=1 when cancel comes from a different Session', () => {
       const { engine, gateway } = makeOpenSetup();
 
       gateway.handleMessage(makeNewOrderMsg({}, SESSION_A));
@@ -931,8 +1005,34 @@ describe('Gateway', () => {
       gateway.handleMessage(makeCancelMsg(orderId, {}, SESSION_B));
 
       expect(engine.sent).toHaveLength(1);
-      expect(engine.sent[0]!.sessionId).toBe(SESSION_B); // Rejected ER goes to requester
-      expect(engine.sent[0]!.fields.get(39)).toBe('8');  // Rejected
+      expect(engine.sent[0]!.sessionId).toBe(SESSION_B); // reject goes to requester
+      expect(engine.sent[0]!.fields.get(35)).toBe('9');  // OrderCancelReject
+      expect(engine.sent[0]!.fields.get(102)).toBe('1'); // CxlRejReason = Unknown order
+    });
+
+    it('sends 35=9 with CxlRejReason=1 when OrderID is missing from the cancel request', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeMockMessage({ 35: 'F', 11: 'CXL-001', 55: 'CLM26', 54: '1' }, SESSION_A));
+
+      expect(engine.sent).toHaveLength(1);
+      expect(engine.sent[0]!.fields.get(35)).toBe('9');  // OrderCancelReject
+      expect(engine.sent[0]!.fields.get(102)).toBe('1'); // CxlRejReason = Unknown order
+    });
+
+    it('35=9 echoes OrigClOrdID from the cancel request', () => {
+      const { engine, gateway } = makeOpenSetup();
+
+      gateway.handleMessage(makeNewOrderMsg({}, SESSION_A));
+      const orderId = engine.sent.at(-1)!.fields.get(37)!;
+      engine.sent.length = 0;
+
+      gateway.handleMessage(makeMockMessage({
+        35: 'F', 37: orderId, 11: 'CXL-99', 41: 'ORIG-ORD-11', 55: 'CLM26', 54: '1',
+      }, SESSION_B));
+
+      expect(engine.sent[0]!.fields.get(35)).toBe('9');           // OrderCancelReject
+      expect(engine.sent[0]!.fields.get(41)).toBe('ORIG-ORD-11'); // OrigClOrdID echoed
     });
 
     it('Cancelled ER echoes OrderID, ClOrdID, Symbol, Side and carries correct quantities', () => {

@@ -43,6 +43,10 @@ const TAG = {
   MD_ENTRY_SIZE:           271,
   MD_ENTRY_ID:             278,
   MD_UPDATE_ACTION:        279,
+  MD_REQ_REJ_REASON:       281,
+  // Reject reason fields
+  ORD_REJ_REASON:          103,
+  CXL_REJ_REASON:          102,
 } as const;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -65,6 +69,21 @@ function toFIXDate(date: Date): string {
 function isOnTick(price: number, tickSize: number): boolean {
   const ratio = price / tickSize;
   return Math.abs(ratio - Math.round(ratio)) < 1e-9;
+}
+
+function toCxlRejReason(cancelReason: string | undefined): string {
+  switch (cancelReason) {
+    case 'CannotCancelFilledOrder': return '0'; // Too late to cancel
+    case 'CrossSessionCancel':      return '1'; // Unknown order (to requesting session)
+    case 'MissingOrderID':          return '1'; // Unknown order
+    default:                        return '0';
+  }
+}
+
+function toOrdRejReason(reason: string): string {
+  if (reason.startsWith('Unknown symbol')) return '1'; // Unknown symbol
+  if (reason.startsWith('Market is'))     return '2'; // Exchange closed
+  return '99'; // Other
 }
 
 /**
@@ -347,17 +366,18 @@ export class Gateway {
   // ─── Private: OrderCancelRequest handler ─────────────────────────────────
 
   private handleCancelRequest(msg: IMessage): void {
-    const sessionId = msg.sessionId;
-    const clOrdId  = msg.get(TAG.CL_ORD_ID)  ?? '';
-    const orderId  = msg.get(TAG.ORDER_ID);
-    const symbol   = msg.get(TAG.SYMBOL)     ?? '';
-    const sideRaw  = msg.get(TAG.SIDE)       ?? '1';
+    const sessionId  = msg.sessionId;
+    const clOrdId    = msg.get(TAG.CL_ORD_ID)      ?? '';
+    const origClOrdId = msg.get(TAG.ORIG_CL_ORD_ID) ?? '';
+    const orderId    = msg.get(TAG.ORDER_ID);
+    const symbol     = msg.get(TAG.SYMBOL)          ?? '';
+    const sideRaw    = msg.get(TAG.SIDE)            ?? '1';
 
     if (!orderId) {
-      // Cannot identify the order without OrderID — reject immediately.
-      this.engine.sendMessage(sessionId, this.buildCancelER({
-        orderId: 'NONE', clOrdId, symbol, sideRaw,
-        status: '8', cumQty: 0, originalQty: 0, cancelReason: 'MissingOrderID',
+      // Cannot identify the order without OrderID — reject immediately with 35=9.
+      this.engine.sendMessage(sessionId, this.buildCancelReject({
+        orderId: 'NONE', clOrdId, origClOrdId, symbol, sideRaw,
+        ordStatus: '8', cancelReason: 'MissingOrderID',
       }));
       return;
     }
@@ -379,21 +399,34 @@ export class Gateway {
     }
 
     const update = this.orderManager.cancel({ orderId }, sessionId);
-    const fixStatus = toFIXStatus(update.state);
 
+    if (update.state !== 'Cancelled') {
+      // Cancel was rejected — send 35=9 (OrderCancelReject).
+      this.engine.sendMessage(sessionId, this.buildCancelReject({
+        orderId,
+        clOrdId,
+        origClOrdId,
+        symbol,
+        sideRaw,
+        ordStatus: toFIXStatus(update.state),
+        cancelReason: update.cancelReason,
+      }));
+      return;
+    }
+
+    // Cancel succeeded — send 35=8 (ExecutionReport).
     this.engine.sendMessage(sessionId, this.buildCancelER({
       orderId,
       clOrdId,
       symbol,
       sideRaw,
-      status: fixStatus,
+      status: '4',
       cumQty: update.filledQuantity,
       originalQty,
-      cancelReason: update.cancelReason,
     }));
 
     // Publish market data event for client-initiated cancels.
-    if (update.state === 'Cancelled' && preSnapshotOrder && symbol) {
+    if (preSnapshotOrder) {
       this.publisher.publish(symbol, {
         type: 'OrderCancelled',
         order: { ...preSnapshotOrder, state: 'Cancelled' },
@@ -407,17 +440,16 @@ export class Gateway {
     const sideRaw = info.side === 'Buy' ? '1' : '2';
     this.engine.sendMessage(info.sessionId, this.buildCancelER({
       orderId: info.orderId,
-      clOrdId: '',         // no cancel-request ClOrdID for engine-initiated cancels
+      clOrdId: '',   // no cancel-request ClOrdID for engine-initiated cancels
       symbol,
       sideRaw,
-      status: '4',         // Cancelled
+      status: '4',   // Cancelled
       cumQty: info.update.filledQuantity,
       originalQty: info.originalQty,
-      cancelReason: info.update.cancelReason,
     }));
   }
 
-  // ─── Private: cancel / cancel-reject ER builder ──────────────────────────
+  // ─── Private: successful cancel ER (35=8) ────────────────────────────────
 
   private buildCancelER(opts: {
     orderId: string;
@@ -427,9 +459,8 @@ export class Gateway {
     status: string;
     cumQty: number;
     originalQty: number;
-    cancelReason?: string;
   }): Map<number, string> {
-    const fields = new Map<number, string>([
+    return new Map<number, string>([
       [TAG.MSG_TYPE,   '8'],
       [TAG.ORDER_ID,   opts.orderId],
       [TAG.CL_ORD_ID, opts.clOrdId],
@@ -442,6 +473,29 @@ export class Gateway {
       [TAG.CUM_QTY,    String(opts.cumQty)],
       [TAG.LEAVES_QTY, '0'],
       [TAG.AVG_PX,     '0'],
+    ]);
+  }
+
+  // ─── Private: cancel reject (35=9) ───────────────────────────────────────
+
+  private buildCancelReject(opts: {
+    orderId: string;
+    clOrdId: string;
+    origClOrdId: string;
+    symbol: string;
+    sideRaw: string;
+    ordStatus: string;
+    cancelReason?: string;
+  }): Map<number, string> {
+    const fields = new Map<number, string>([
+      [TAG.MSG_TYPE,        '9'],
+      [TAG.ORDER_ID,        opts.orderId],
+      [TAG.CL_ORD_ID,       opts.clOrdId],
+      [TAG.ORIG_CL_ORD_ID,  opts.origClOrdId],
+      [TAG.ORD_STATUS,      opts.ordStatus],
+      [TAG.CXL_REJ_REASON,  toCxlRejReason(opts.cancelReason)],
+      [TAG.SYMBOL,          opts.symbol],
+      [TAG.SIDE,            opts.sideRaw],
     ]);
     if (opts.cancelReason) {
       fields.set(TAG.TEXT, opts.cancelReason);
@@ -460,6 +514,16 @@ export class Gateway {
     if (subReqType === '2') {
       // Unsubscribe
       this.publisher.unsubscribe(sessionId, symbol);
+      return;
+    }
+
+    if (!this.registry.get(symbol)) {
+      this.engine.sendMessage(sessionId, new Map<number, string>([
+        [TAG.MSG_TYPE,          'Y'],
+        [TAG.MD_REQ_ID,         reqId],
+        [TAG.MD_REQ_REJ_REASON, '0'], // Unknown symbol
+        [TAG.TEXT,              `Unknown symbol: ${symbol}`],
+      ]));
       return;
     }
 
@@ -629,19 +693,20 @@ export class Gateway {
     opts: { clOrdId: string; symbol: string; sideRaw: string; qty: number; reason: string },
   ): void {
     this.engine.sendMessage(sessionId, new Map<number, string>([
-      [TAG.MSG_TYPE,   '8'],
-      [TAG.ORDER_ID,   'NONE'],
-      [TAG.CL_ORD_ID, opts.clOrdId],
-      [TAG.EXEC_ID,    String(++this.execIdSeq)],
-      [TAG.EXEC_TYPE,  '8'],
-      [TAG.ORD_STATUS, '8'],
-      [TAG.SYMBOL,     opts.symbol],
-      [TAG.SIDE,       opts.sideRaw],
-      [TAG.ORDER_QTY,  String(opts.qty)],
-      [TAG.CUM_QTY,    '0'],
-      [TAG.LEAVES_QTY, '0'],
-      [TAG.AVG_PX,     '0'],
-      [TAG.TEXT,       opts.reason],
+      [TAG.MSG_TYPE,      '8'],
+      [TAG.ORDER_ID,      'NONE'],
+      [TAG.CL_ORD_ID,     opts.clOrdId],
+      [TAG.EXEC_ID,       String(++this.execIdSeq)],
+      [TAG.EXEC_TYPE,     '8'],
+      [TAG.ORD_STATUS,    '8'],
+      [TAG.SYMBOL,        opts.symbol],
+      [TAG.SIDE,          opts.sideRaw],
+      [TAG.ORDER_QTY,     String(opts.qty)],
+      [TAG.CUM_QTY,       '0'],
+      [TAG.LEAVES_QTY,    '0'],
+      [TAG.AVG_PX,        '0'],
+      [TAG.ORD_REJ_REASON, toOrdRejReason(opts.reason)],
+      [TAG.TEXT,          opts.reason],
     ]));
   }
 }
